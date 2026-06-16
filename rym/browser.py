@@ -24,6 +24,10 @@ class ServerOverloadError(Exception):
         super().__init__(message or f"Server error {status_code}")
 
 
+class ChallengeSolvedRetry(Exception):
+    """Internal signal used to retry a request after Cloudflare was solved."""
+
+
 class BrowserManager:
     """Manages browser configuration, Cloudflare challenges, and resource blocking."""
 
@@ -261,17 +265,47 @@ class BrowserManager:
                 self.logger.error("No more ports available")
                 return False
 
+    def _content_has_challenge(self, content: str) -> bool:
+        """Detect Cloudflare challenge markers in response/page content."""
+        return bool(
+            content
+            and 'Just a moment...' in content
+            and '<title>Just a moment...</title>' in content
+        )
+
+    def _is_usable_html_after_challenge(self, content: str) -> bool:
+        """Return True when post-solve page content looks like the target HTML.
+
+        After a successful Turnstile click, Playwright/Camoufox can remain on a
+        tiny empty plaintext document while Cloudflare cookies are being set. In
+        that case we still need one more navigation; returning that empty page as
+        a successful scrape causes metadata extraction to fail.
+        """
+        if not content or self._content_has_challenge(content):
+            return False
+
+        if len(content.strip()) < 500:
+            return False
+
+        if 'resource://content-accessible/plaintext.css' in content:
+            return False
+
+        return True
+
+    async def _wait_before_challenge_retry(self) -> None:
+        """Cooldown before retrying immediately after a Cloudflare solve."""
+        delay = max(float(getattr(self.config, 'min_request_interval', 0) or 0), 8.0)
+        self.logger.info(f"Waiting {delay:.1f}s before retrying after challenge solve")
+        await asyncio.sleep(delay)
+
     def _is_challenge(self, response: Response, content: str) -> bool:
         """Simple challenge detection using header and content."""
         # Method 1: Check cf-mitigated header
         if hasattr(response, 'headers') and response.headers.get('cf-mitigated') == 'challenge':
             return True
-        
-        # Method 2: Check for challenge HTML in content
-        if 'Just a moment...' in content and '<title>Just a moment...</title>' in content:
-            return True
 
-        return False
+        # Method 2: Check for challenge HTML in content
+        return self._content_has_challenge(content)
 
     async def _solve_challenge_on_homepage(self, page: Page):
         """Navigate to homepage and solve challenge if present."""
@@ -314,6 +348,7 @@ class BrowserManager:
         def decorator(request_func):
             @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=2, min=2, max=30))
             async def wrapper(self, page: Page, url: str, *args, **kwargs):
+                request_timestamp = time.time()
                 try:
                     # Execute the actual request function
                     response, content = await request_func(self, page, url, *args, **kwargs)
@@ -332,8 +367,28 @@ class BrowserManager:
                             # Cloudflare cookies are domain-wide, so homepage solve works for all endpoints
                             await self._solve_challenge_on_homepage(page)
 
-                        # After solving, retry this request
-                        raise Exception("Challenge solved, retrying request")
+                        if response_type == 'html':
+                            # For page navigations Cloudflare usually redirects to the originally
+                            # requested URL after solving. Re-use the loaded page instead of issuing
+                            # an immediate second navigation, which can trigger RYM overload/rate
+                            # limiting right after a challenge.
+                            try:
+                                await page.wait_for_load_state('domcontentloaded', timeout=15000)
+                            except PlaywrightTimeoutError:
+                                self.logger.debug("Timed out waiting for DOM after challenge solve; checking current content")
+
+                            solved_content = await page.content()
+                            if self._is_usable_html_after_challenge(solved_content):
+                                self.logger.info("Challenge solved; using loaded page content")
+                                return solved_content
+
+                            self.logger.info("Challenge solved, but current page content is not usable; retrying request")
+
+                        # AJAX requests cannot be satisfied from the challenge page; retry them.
+                        # HTML also retries when the browser is left on Cloudflare's empty plaintext
+                        # placeholder instead of the target page.
+                        await self._wait_before_challenge_retry()
+                        raise ChallengeSolvedRetry("Challenge solved, retrying request")
 
                     # Check status code
                     if response.status == 503:
@@ -346,14 +401,18 @@ class BrowserManager:
                     return content
 
                 except ServerOverloadError:
-                    # Handle IP rotation
-                    request_timestamp = time.time()
+                    # Handle IP rotation. Use the timestamp from before the request started so
+                    # concurrent pages can identify stale errors from an already-rotated IP.
                     if await self._handle_server_overload_rotation(page, request_timestamp):
                         self.logger.info("IP rotated, retrying request")
                         raise  # Let @retry decorator handle the retry
                     else:
                         self.logger.error("No more IPs available")
                         return None
+
+                except ChallengeSolvedRetry as e:
+                    self.logger.info(f"{e}")
+                    raise
 
                 except Exception as e:
                     self.logger.error(f"Error during request to {url}: {e}")
@@ -363,7 +422,7 @@ class BrowserManager:
         return decorator
 
     @_with_protection(response_type='html')
-    async def fetch_html(self, page: Page, url: str) -> tuple[Optional[Response], Optional[str]]:
+    async def fetch_html(self, page: Page, url: str, referer: Optional[str] = None) -> tuple[Optional[Response], Optional[str]]:
         """Fetch HTML page with automatic challenge handling and IP rotation.
 
         Uses page.goto() for navigation. Handles Cloudflare challenges by solving
@@ -372,14 +431,19 @@ class BrowserManager:
         Args:
             page: Playwright page instance
             url: Target URL to fetch
+            referer: Optional Referer header to send with the navigation
 
         Returns:
             HTML content as string, or None if request failed
         """
-        self.logger.debug(f"Navigating to {url}")
+        self.logger.debug(f"Navigating to {url}" + (f" with referer {referer}" if referer else ""))
 
-        # Make request
-        response = await page.goto(url, wait_until='commit', timeout=10000)
+        # Make request. Some RYM release pages return a Cloudflare 503 unless they are
+        # reached from the artist page/discography, so preserve that Referer when known.
+        goto_kwargs = {'wait_until': 'commit', 'timeout': 10000}
+        if referer:
+            goto_kwargs['referer'] = referer
+        response = await page.goto(url, **goto_kwargs)
 
         # Wait for DOM
         await page.wait_for_load_state('domcontentloaded', timeout=15000)
@@ -519,6 +583,7 @@ class BrowserManager:
             For HTML: HTML string content or None if failed
             For JSON: Parsed JSON object or None if failed
         """
+        request_timestamp = time.time()
         try:
             # 1. Make the request
             if response_type == 'json':
@@ -604,13 +669,27 @@ class BrowserManager:
                     # For HTML, solve on current page
                     await self._solve_challenge_on_current_page(page, url)
 
-                # After solving, retry this request
-                raise Exception("Challenge solved, retrying request")
+                if response_type == 'html':
+                    try:
+                        await page.wait_for_load_state('domcontentloaded', timeout=15000)
+                    except PlaywrightTimeoutError:
+                        self.logger.debug("Timed out waiting for DOM after challenge solve; checking current content")
+
+                    solved_content = await page.content()
+                    if self._is_usable_html_after_challenge(solved_content):
+                        self.logger.info("Challenge solved; using loaded page content")
+                        return solved_content
+
+                    self.logger.info("Challenge solved, but current page content is not usable; retrying request")
+
+                # After solving, retry this request if it cannot be satisfied from current page content
+                await self._wait_before_challenge_retry()
+                raise ChallengeSolvedRetry("Challenge solved, retrying request")
 
             # 3. Check status code
             if response.status != 200:
                 if response.status == 503:
-                    raise ServerOverloadError(f"503 error from {url}")
+                    raise ServerOverloadError(503, f"503 error from {url}")
                 elif response.status >= 400:
                     self.logger.warning(f"Request failed with status {response.status}")
                     return None
@@ -635,14 +714,18 @@ class BrowserManager:
                 return html_content
 
         except ServerOverloadError:
-            # Handle IP rotation
-            request_timestamp = time.time()
+            # Handle IP rotation. Use the timestamp from before the request started so
+            # concurrent pages can identify stale errors from an already-rotated IP.
             if await self._handle_server_overload_rotation(page, request_timestamp):
                 self.logger.info("IP rotated, retrying request")
                 raise  # Let @retry handle the retry
             else:
                 self.logger.error("No more IPs available")
                 return None
+
+        except ChallengeSolvedRetry as e:
+            self.logger.info(f"{e}")
+            raise
 
         except Exception as e:
             self.logger.error(f"Error during navigation to {url}: {e}")

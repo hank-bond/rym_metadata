@@ -221,13 +221,14 @@ class RYMScraper:
         return page
 
 
-    async def navigate_page_with_rate_limiting(self, url: str, page: Any, response_type: str = 'html') -> Optional[Any]:
+    async def navigate_page_with_rate_limiting(self, url: str, page: Any, response_type: str = 'html', referer: Optional[str] = None) -> Optional[Any]:
         """Navigate with scraper-specific rate limiting.
 
         Args:
             url: URL to navigate to
             page: Playwright page object
             response_type: 'html' for HTML content (default), 'json' for JSON API responses
+            referer: Optional Referer header for HTML navigations
 
         Returns:
             HTML string for response_type='html', parsed JSON for response_type='json'
@@ -239,7 +240,7 @@ class RYMScraper:
         if response_type == 'json':
             result = await self.browser_manager.fetch_ajax_json(page, url)
         else:  # 'html'
-            result = await self.browser_manager.fetch_html(page, url)
+            result = await self.browser_manager.fetch_html(page, url, referer=referer)
 
         # Update scraper timing for rate limiting
         self._update_request_time()
@@ -278,9 +279,10 @@ class RYMScraper:
 
                 # Try direct album URL
                 direct_url = self.build_direct_url(artist, album, album_type)
+                artist_referer_url = self.build_artist_url(artist)
                 self.logger.debug(f"Trying direct album URL: {direct_url}")
 
-                html = await self.navigate_page_with_rate_limiting(direct_url, page)
+                html = await self.navigate_page_with_rate_limiting(direct_url, page, referer=artist_referer_url)
                 result = self._extract_metadata_from_html(html) if html else ScraperResult([], [], None)
 
                 # Cache successful album result
@@ -301,7 +303,7 @@ class RYMScraper:
                         album_url = await self._search_discography_by_artist_id(cached_artist_id, album, page, year)
 
                         if album_url:
-                            html = await self.navigate_page_with_rate_limiting(album_url, page)
+                            html = await self.navigate_page_with_rate_limiting(album_url, page, referer=artist_referer_url)
                             result = self._extract_metadata_from_html(html) if html else ScraperResult([], [], None)
 
                             # Cache successful result
@@ -322,7 +324,7 @@ class RYMScraper:
                             album_url = await self._search_artist_discography(artist_page_url, album, page, year)
 
                             if album_url:
-                                html = await self.navigate_page_with_rate_limiting(album_url, page)
+                                html = await self.navigate_page_with_rate_limiting(album_url, page, referer=artist_page_url)
                                 result = self._extract_metadata_from_html(html) if html else ScraperResult([], [], None)
 
                                 # Cache successful result

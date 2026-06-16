@@ -4,7 +4,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='rym-metadata',
-    version='1.4.4',
+    version='1.4.5',
     description='RateYourMusic metadata scraper - standalone library and beets plugin',
     author='RYM Metadata',
     packages=find_packages(),
@@ -23,9 +23,9 @@ setup(
         'urllib3>=1.26.0',
 
         # Browser automation
-        'camoufox[geoip]>=0.3.0',
-        'camoufox-captcha>=0.1.0',
-        'playwright>=1.40.0',
+        'camoufox[geoip]==0.4.11',
+        'camoufox-captcha==0.1.3',
+        'playwright==1.59.0',
 
         # Retry and resilience
         'tenacity>=8.0.0',
